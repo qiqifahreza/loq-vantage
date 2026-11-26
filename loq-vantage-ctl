@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""
+loq-vantage-ctl: Privileged sysfs & HID helper for Lenovo LOQ 15IRX9 (83DV)
+"""
+import fcntl
+import glob
+import json
+import os
+import re
+import sys
+
+VPC_DIR = "/sys/bus/platform/devices/VPC2004:00"
+ALLOWED_VPC_TOGGLES = {"fn_lock", "usb_charging", "camera_power", "touchpad"}
+HIDIOCSFEATURE_33 = 0xC0214806
+
+
+def read_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def write_file(path, value):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(value) + "\n")
+
+
+def find_platform_profile_paths():
+    for base in sorted(glob.glob("/sys/class/platform-profile/*")):
+        name = read_file(os.path.join(base, "name")) or ""
+        prof = os.path.join(base, "profile")
+        choices = os.path.join(base, "choices")
+        if os.path.exists(prof) and ("lenovo" in name or "ideapad" in name):
+            return prof, choices
+    legacy_prof = "/sys/firmware/acpi/platform_profile"
+    legacy_choices = "/sys/firmware/acpi/platform_profile_choices"
+    if os.path.exists(legacy_prof):
+        return legacy_prof, legacy_choices
+    return None, None
+
+
+def find_battery_dir():
+    for bat in sorted(glob.glob("/sys/class/power_supply/BAT*")):
+        if os.path.exists(os.path.join(bat, "capacity")):
+            return bat
+    return None
+
+
+def find_wmi_other_attrs_dir():
+    for d in sorted(glob.glob("/sys/class/firmware-attributes/lenovo-wmi-other*/attributes")):
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def find_wmi_hwmon_dir():
+    for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        name = (read_file(os.path.join(d, "name")) or "").lower()
+        if any(k in name for k in ("lenovo", "legion", "ideapad")):
+            if glob.glob(os.path.join(d, "fan*_input")) or glob.glob(os.path.join(d, "fan*_target")):
+                return d
+    return None
+
+
+def get_battery_mode():
+    bat = find_battery_dir()
+    if bat:
+        ct_path = os.path.join(bat, "charge_types")
+        if os.path.exists(ct_path):
+            raw = read_file(ct_path)
+            if raw:
+                for token in raw.split():
+                    if token.startswith("[") and token.endswith("]"):
+                        mode = token[1:-1]
+                        if mode == "Long_Life":
+                            return "conservation"
+                        if mode == "Fast":
+                            return "rapid"
+                        return "standard"
+    cons_path = os.path.join(VPC_DIR, "conservation_mode")
+    val = read_file(cons_path)
+    if val == "1":
+        return "conservation"
+    if val == "0":
+        return "standard"
+    return "unknown"
+
+
+def set_battery_mode(mode):
+    mapping = {
+        "standard": "Standard",
+        "conservation": "Long_Life",
+        "rapid": "Fast",
+    }
+    if mode not in mapping:
+        raise ValueError(f"Mode baterai tidak valid: {mode}")
+
+    bat = find_battery_dir()
+    ct_path = os.path.join(bat, "charge_types") if bat else None
+    cons_path = os.path.join(VPC_DIR, "conservation_mode")
+
+    if ct_path and os.path.exists(ct_path):
+        target = mapping[mode]
+        try:
+            write_file(ct_path, target)
+            return
+        except OSError:
+            pass
+
+    if os.path.exists(cons_path):
+        if mode == "conservation":
+            write_file(cons_path, "1")
+        elif mode == "standard":
+            write_file(cons_path, "0")
+        else:
+            raise RuntimeError("Rapid Charge memerlukan dukungan charge_types di kernel.")
+    else:
+        raise FileNotFoundError("Interface pengaturan baterai tidak ditemukan.")
+
+
+def set_profile(profile):
+    prof_path, choices_path = find_platform_profile_paths()
+    if not prof_path:
+        raise FileNotFoundError("platform_profile tidak tersedia.")
+    choices = (read_file(choices_path) or "").split()
+    if choices and profile not in choices:
+        raise ValueError(f"Profil '{profile}' tidak didukung. Pilihan: {choices}")
+    write_file(prof_path, profile)
+
+
+def set_ideapad_toggle(key, val):
+    if key not in ALLOWED_VPC_TOGGLES:
+        raise ValueError(f"Toggle tidak diizinkan: {key}")
+    if val not in ("0", "1"):
+        raise ValueError("Nilai harus 0 atau 1")
+    target = os.path.join(VPC_DIR, key)
+    if not os.path.exists(target):
+        raise FileNotFoundError(f"Node tidak ditemukan: {target}")
+    write_file(target, val)
+
+
+def set_wmi_attr(attr_name, val):
+    if not all(c.isalnum() or c == "_" for c in attr_name):
+        raise ValueError("Nama atribut tidak valid")
+    attrs_dir = find_wmi_other_attrs_dir()
+    if not attrs_dir:
+        raise FileNotFoundError("lenovo-wmi-other tidak ditemukan.")
+    attr_dir = os.path.join(attrs_dir, attr_name)
+    if not os.path.isdir(attr_dir):
+        raise FileNotFoundError(f"Atribut '{attr_name}' tidak ada.")
+
+    val_int = int(val)
+    min_v = read_file(os.path.join(attr_dir, "min_value"))
+    max_v = read_file(os.path.join(attr_dir, "max_value"))
+    if min_v is not None and val_int < int(min_v):
+        raise ValueError(f"Nilai di bawah batas minimum ({min_v})")
+    if max_v is not None and val_int > int(max_v):
+        raise ValueError(f"Nilai di atas batas maksimum ({max_v})")
+
+    write_file(os.path.join(attr_dir, "current_value"), str(val_int))
+
+
+def set_fan_target(fan_idx, rpm):
+    idx = int(fan_idx)
+    rpm_val = int(rpm)
+    if idx not in (1, 2):
+        raise ValueError("Index kipas harus 1 atau 2")
+    if rpm_val < 0 or rpm_val > 7000:
+        raise ValueError("RPM di luar rentang aman (0 - 7000)")
+    hwmon = find_wmi_hwmon_dir()
+    if not hwmon:
+        raise FileNotFoundError("hwmon kipas Lenovo tidak ditemukan.")
+    target = os.path.join(hwmon, f"fan{idx}_target")
+    if not os.path.exists(target):
+        raise FileNotFoundError(f"fan{idx}_target tidak tersedia.")
+    write_file(target, str(rpm_val))
+
+
+def set_kbd_sysfs(brightness):
+    b = int(brightness)
+    for led in sorted(glob.glob("/sys/class/leds/*::kbd_backlight")):
+        max_b = int(read_file(os.path.join(led, "max_brightness")) or "2")
+        if 0 <= b <= max_b:
+            write_file(os.path.join(led, "brightness"), str(b))
+            return
+    raise FileNotFoundError("Sysfs keyboard backlight tidak ditemukan.")
+
+
+def set_rgb_hidraw(hidraw_name, hex_payload):
+    if not re.fullmatch(r"hidraw[0-9]+", hidraw_name):
+        raise ValueError("Nama hidraw tidak valid")
+    raw = bytes.fromhex(hex_payload)
+    if len(raw) != 33 or raw[0] != 0xCC or raw[1] != 0x16:
+        raise ValueError("Payload RGB tidak valid")
+    dev_path = os.path.join("/dev", hidraw_name)
+    buf = bytearray(raw)
+    fd = os.open(dev_path, os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, HIDIOCSFEATURE_33, buf)
+    finally:
+        os.close(fd)
+
+
+def enable_fan_sensor():
+    conf = "/etc/modprobe.d/loq-vantage-fans.conf"
+    write_file(conf, "options lenovo_wmi_other expose_all_fans=1")
+
+
+def get_status():
+    prof_path, choices_path = find_platform_profile_paths()
+    toggles = {}
+    for k in sorted(ALLOWED_VPC_TOGGLES):
+        p = os.path.join(VPC_DIR, k)
+        if os.path.exists(p):
+            toggles[k] = read_file(p)
+    return {
+        "model": read_file("/sys/class/dmi/id/product_version"),
+        "product_name": read_file("/sys/class/dmi/id/product_name"),
+        "bios": read_file("/sys/class/dmi/id/bios_version"),
+        "profile": read_file(prof_path) if prof_path else None,
+        "profile_choices": (read_file(choices_path) or "").split() if choices_path else [],
+        "battery_mode": get_battery_mode(),
+        "toggles": toggles,
+    }
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Penggunaan: loq-vantage-ctl <status|profile|battery|ideapad|wmi-attr|fan-target|kbd-sysfs|rgb|enable-fan-sensor> ...")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    try:
+        if cmd == "status":
+            print(json.dumps(get_status(), indent=2))
+        elif cmd == "profile" and len(sys.argv) == 3:
+            set_profile(sys.argv[2])
+        elif cmd == "battery" and len(sys.argv) == 3:
+            set_battery_mode(sys.argv[2])
+        elif cmd == "ideapad" and len(sys.argv) == 4:
+            set_ideapad_toggle(sys.argv[2], sys.argv[3])
+        elif cmd == "wmi-attr" and len(sys.argv) == 4:
+            set_wmi_attr(sys.argv[2], sys.argv[3])
+        elif cmd == "fan-target" and len(sys.argv) == 4:
+            set_fan_target(sys.argv[2], sys.argv[3])
+        elif cmd == "kbd-sysfs" and len(sys.argv) == 3:
+            set_kbd_sysfs(sys.argv[2])
+        elif cmd == "rgb" and len(sys.argv) == 4:
+            set_rgb_hidraw(sys.argv[2], sys.argv[3])
+        elif cmd == "enable-fan-sensor":
+            enable_fan_sensor()
+        else:
+            print("Argumen tidak valid.", file=sys.stderr)
+            sys.exit(2)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

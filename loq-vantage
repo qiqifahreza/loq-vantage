@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""
+LOQ Vantage - Lenovo Vantage alternative for Arch Linux (Lenovo LOQ 15IRX9 / 83DV)
+"""
+import fcntl
+import glob
+import os
+import subprocess
+import threading
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk
+
+CTL_BIN = "/usr/bin/loq-vantage-ctl"
+VPC_DIR = "/sys/bus/platform/devices/VPC2004:00"
+HIDIOCSFEATURE_33 = 0xC0214806  # _IOWR('H', 0x06, 33)
+ITE_VENDOR_ID = "0000048D"
+
+
+def read_sys(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def find_platform_profile_paths():
+    for base in sorted(glob.glob("/sys/class/platform-profile/*")):
+        name = read_sys(os.path.join(base, "name")) or ""
+        prof = os.path.join(base, "profile")
+        choices = os.path.join(base, "choices")
+        if os.path.exists(prof) and ("lenovo" in name or "ideapad" in name):
+            return prof, choices
+    legacy_prof = "/sys/firmware/acpi/platform_profile"
+    legacy_choices = "/sys/firmware/acpi/platform_profile_choices"
+    if os.path.exists(legacy_prof):
+        return legacy_prof, legacy_choices
+    return None, None
+
+
+def find_battery_dir():
+    for bat in sorted(glob.glob("/sys/class/power_supply/BAT*")):
+        if os.path.exists(os.path.join(bat, "capacity")):
+            return bat
+    return None
+
+
+def find_rgb_candidates():
+    """
+    Cari semua node hidraw milik ITE (048D) dan urutkan berdasarkan kecocokan descriptor:
+    Report ID 0xCC (85 cc) dan Usage Page 0xFF89 (06 89 ff).
+    """
+    candidates = []
+    for dev in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        uevent = read_sys(os.path.join(dev, "device", "uevent")) or ""
+        hid_id = ""
+        for line in uevent.splitlines():
+            if line.startswith("HID_ID="):
+                hid_id = line.split("=", 1)[1].upper()
+                break
+        parts = hid_id.split(":")
+        if len(parts) == 3 and parts[1] == ITE_VENDOR_ID:
+            pid = parts[2][-4:]
+            rdesc_path = os.path.join(dev, "device", "report_descriptor")
+            rdesc = b""
+            try:
+                with open(rdesc_path, "rb") as f:
+                    rdesc = f.read()
+            except OSError:
+                pass
+            has_ff89 = b"\x06\x89\xff" in rdesc
+            has_cc = b"\x85\xcc" in rdesc
+            score = (2 if has_cc else 0) + (1 if has_ff89 else 0)
+            dev_path = os.path.join("/dev", os.path.basename(dev))
+            flags = []
+            if has_cc:
+                flags.append("0xCC")
+            if has_ff89:
+                flags.append("0xFF89")
+            flag_str = "+".join(flags) if flags else "Generic"
+            candidates.append((score, dev_path, f"{dev_path} (048D:{pid} • {flag_str})"))
+
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return candidates
+
+
+def build_rgb_packet(effect, speed, brightness, zones_rgb, wave_dir=0):
+    buf = bytearray(33)
+    buf[0] = 0xCC
+    buf[1] = 0x16
+    buf[2] = effect
+    buf[3] = speed
+    buf[4] = brightness
+    for i in range(4):
+        r, g, b = zones_rgb[i]
+        buf[5 + i * 3] = r
+        buf[6 + i * 3] = g
+        buf[7 + i * 3] = b
+    # Byte 18 (rtl) & Byte 19 (ltr) untuk efek Wave (0x04)
+    if effect == 0x04:
+        if wave_dir == 0:
+            buf[19] = 0x01  # Kiri -> Kanan
+        else:
+            buf[18] = 0x01  # Kanan -> Kiri
+    return buf
+
+
+def send_rgb_packet_direct(hidraw_path, buf):
+    fd = os.open(hidraw_path, os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, HIDIOCSFEATURE_33, buf)
+    finally:
+        os.close(fd)
+
+
+def get_nvidia_status():
+    for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        vendor = read_sys(os.path.join(dev, "vendor"))
+        dev_class = read_sys(os.path.join(dev, "class")) or ""
+        if vendor == "0x10de" and dev_class.startswith("0x03"):
+            rstatus = read_sys(os.path.join(dev, "power/runtime_status"))
+            if rstatus == "suspended":
+                return "Tidur (D3cold — Hemat Daya)"
+            try:
+                out = subprocess.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=name,temperature.gpu,utilization.gpu,power.draw,memory.used,memory.total",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    text=True,
+                    timeout=2,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+                if out:
+                    name, temp, util, pwr, mem_u, mem_t = [x.strip() for x in out.split(",")]
+                    return f"{name} | {temp}°C | Load {util}% | {pwr} W | VRAM {mem_u}/{mem_t} MiB"
+            except Exception:
+                return f"Aktif ({rstatus or 'unknown'}) — nvidia-smi tidak tersedia"
+    return "Tidak terdeteksi / Hanya iGPU"
+
+
+def get_cpu_telemetry():
+    temps = []
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if read_sys(os.path.join(hw, "name")) == "coretemp":
+            for t in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
+                val = read_sys(t)
+                if val and val.isdigit():
+                    temps.append(int(val) / 1000.0)
+            break
+    pkg_temp = f"{temps[0]:.0f}°C" if temps else "N/A"
+
+    freqs = []
+    for fpath in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq"):
+        v = read_sys(fpath)
+        if v and v.isdigit():
+            freqs.append(int(v) / 1000.0)
+    avg_freq = f"{sum(freqs)/len(freqs):.0f} MHz" if freqs else "N/A"
+    return f"Suhu Paket: {pkg_temp}  |  Rata-rata Clock: {avg_freq}"
+
+
+def get_fans_telemetry():
+    """
+    Cari sensor kipas di hwmon laptop (lenovo-wmi-other, lenovo_wmi_other, legion_hwmon, ideapad, acpi),
+    atau fallback ke hwmon non-GPU yang memiliki fan*_input.
+    """
+    preferred = []
+    fallback = []
+    all_hwmons = []
+
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        name = read_sys(os.path.join(hw, "name")) or "unknown"
+        fans = sorted(glob.glob(os.path.join(hw, "fan*_input")))
+        all_hwmons.append(f"{os.path.basename(hw)}:{name}")
+        if not fans:
+            continue
+        lname = name.lower()
+        entries = []
+        for idx, fp in enumerate(fans, start=1):
+            label = read_sys(fp.replace("_input", "_label")) or f"Fan {idx}"
+            val = read_sys(fp)
+            if val is not None:
+                entries.append(f"{label}: {val} RPM")
+        if not entries:
+            continue
+        if any(k in lname for k in ("lenovo", "legion", "ideapad", "thinkpad")):
+            preferred.extend(entries)
+        elif lname not in ("amdgpu", "nouveau", "nvidia"):
+            fallback.extend([f"{e} ({name})" for e in entries])
+
+    if preferred:
+        return "  |  ".join(preferred), None
+    if fallback:
+        return "  |  ".join(fallback), None
+
+    # Cek status parameter expose_all_fans pada lenovo_wmi_other
+    exp_param = read_sys("/sys/module/lenovo_wmi_other/parameters/expose_all_fans")
+    if exp_param == "N":
+        hint = "lenovo_wmi_other aktif dengan expose_all_fans=N. Aktifkan di tab Perangkat lalu reboot."
+    elif exp_param == "Y":
+        hint = "BIOS NECN50WW tidak mengekspos tabel fan WMI ke kernel mainline (butuh lenovolegionlinux-dkms jika ingin baca RPM)."
+    else:
+        hint = f"Tidak ada fan*_input di hwmon ({', '.join(all_hwmons[:5])})."
+    return "Sensor RPM tidak diekspos oleh kernel saat ini", hint
+
+
+def get_battery_telemetry():
+    bat = find_battery_dir()
+    if not bat:
+        return "Baterai tidak terdeteksi", "N/A", "unknown"
+
+    cap = read_sys(os.path.join(bat, "capacity")) or "?"
+    status = read_sys(os.path.join(bat, "status")) or "?"
+    cycles = read_sys(os.path.join(bat, "cycle_count")) or "?"
+    power_uw = read_sys(os.path.join(bat, "power_now"))
+    watt_str = f"{int(power_uw) / 1_000_000:.1f} W" if power_uw and power_uw.isdigit() else "-"
+
+    ef = read_sys(os.path.join(bat, "energy_full"))
+    efd = read_sys(os.path.join(bat, "energy_full_design"))
+    health_str = (
+        f"{(int(ef) / int(efd)) * 100:.1f}%"
+        if ef and efd and ef.isdigit() and efd.isdigit() and int(efd) > 0
+        else "?"
+    )
+
+    mode = "unknown"
+    ct_raw = read_sys(os.path.join(bat, "charge_types"))
+    if ct_raw:
+        for tok in ct_raw.split():
+            if tok.startswith("[") and tok.endswith("]"):
+                m = tok[1:-1]
+                mode = {"Long_Life": "conservation", "Fast": "rapid"}.get(m, "standard")
+    else:
+        cval = read_sys(os.path.join(VPC_DIR, "conservation_mode"))
+        if cval == "1":
+            mode = "conservation"
+        elif cval == "0":
+            mode = "standard"
+
+    line1 = f"{cap}% ({status})  •  Daya: {watt_str}"
+    line2 = f"Kesehatan: {health_str}  •  Cycle Count: {cycles}"
+    return line1, line2, mode
+
+
+class LOQVantageWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="LOQ Vantage")
+        self.set_default_size(800, 700)
+        self._updating_ui = False
+
+        self.toast_overlay = Adw.ToastOverlay()
+        toolbar_view = Adw.ToolbarView()
+
+        header = Adw.HeaderBar()
+        self.view_stack = Adw.ViewStack()
+        switcher = Adw.ViewSwitcher(stack=self.view_stack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        header.set_title_widget(switcher)
+        toolbar_view.add_top_bar(header)
+
+        self.build_dashboard_page()
+        self.build_power_page()
+        self.build_keyboard_page()
+        self.build_device_page()
+
+        toolbar_view.set_content(self.view_stack)
+        self.toast_overlay.set_child(toolbar_view)
+        self.set_content(self.toast_overlay)
+
+        self.refresh_state()
+        GLib.timeout_add_seconds(2, self._on_timer)
+
+    def show_toast(self, msg):
+        self.toast_overlay.add_toast(Adw.Toast.new(msg))
+
+    def run_ctl(self, args, on_done=None):
+        def worker():
+            cmd = [CTL_BIN] + args if os.geteuid() == 0 else ["pkexec", CTL_BIN] + args
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            GLib.idle_add(self._handle_ctl_result, res, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_ctl_result(self, res, on_done):
+        if res.returncode != 0:
+            err = res.stderr.strip() or f"Gagal (kode {res.returncode})"
+            if "dismissed" not in err.lower():
+                self.show_toast(f"Error: {err}")
+        else:
+            if on_done:
+                on_done()
+        self.refresh_state()
+
+    # ---------------- PAGE 1: DASHBOARD ----------------
+    def build_dashboard_page(self):
+        page = Adw.PreferencesPage()
+
+        sys_group = Adw.PreferencesGroup(title="Informasi Sistem")
+        model = read_sys("/sys/class/dmi/id/product_version") or "Lenovo LOQ"
+        sku = read_sys("/sys/class/dmi/id/product_name") or "83DV"
+        bios = read_sys("/sys/class/dmi/id/bios_version") or "Unknown"
+
+        self.row_model = Adw.ActionRow(title=f"{model} (Type {sku})", subtitle=f"BIOS: {bios}")
+        self.lbl_profile_badge = Gtk.Label(label="-")
+        self.lbl_profile_badge.add_css_class("pill")
+        self.row_model.add_suffix(self.lbl_profile_badge)
+        sys_group.add(self.row_model)
+        page.add(sys_group)
+
+        tel_group = Adw.PreferencesGroup(title="Telemetri Real-Time")
+        self.row_cpu = Adw.ActionRow(title="Prosesor (CPU)", subtitle="Memuat...")
+        self.row_gpu = Adw.ActionRow(title="Grafis Diskrit (NVIDIA GPU)", subtitle="Memuat...")
+        self.row_fan = Adw.ActionRow(title="Kipas Pendingin", subtitle="Memuat...")
+        self.row_bat = Adw.ActionRow(title="Baterai", subtitle="Memuat...")
+        self.lbl_bat_health = Gtk.Label(label="")
+        self.lbl_bat_health.add_css_class("dim-label")
+        self.row_bat.add_suffix(self.lbl_bat_health)
+
+        for r in (self.row_cpu, self.row_gpu, self.row_fan, self.row_bat):
+            tel_group.add(r)
+        page.add(tel_group)
+
+        self.view_stack.add_titled_with_icon(page, "dashboard", "Dashboard", "computer-symbolic")
+
+    # ---------------- PAGE 2: PERFORMA & DAYA ----------------
+    def build_power_page(self):
+        page = Adw.PreferencesPage()
+
+        therm_group = Adw.PreferencesGroup(
+            title="Mode Termal (Fn + Q)",
+            description="Mengatur profil daya, kipas, dan warna indikator LED tombol power.",
+        )
+        self.profile_buttons = {}
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box.set_homogeneous(True)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+
+        modes = [
+            ("low-power", "Quiet (Biru)"),
+            ("balanced", "Balanced (Putih)"),
+            ("performance", "Performance (Merah)"),
+            ("custom", "Custom (Ungu)"),
+        ]
+        _, choices_path = find_platform_profile_paths()
+        avail_choices = (read_sys(choices_path) or "low-power balanced performance").split()
+
+        first_btn = None
+        for key, label in modes:
+            if key not in avail_choices and key == "custom":
+                continue
+            btn = Gtk.ToggleButton(label=label)
+            if first_btn is None:
+                first_btn = btn
+            else:
+                btn.set_group(first_btn)
+            btn.connect("toggled", self.on_profile_toggled, key)
+            self.profile_buttons[key] = btn
+            box.append(btn)
+
+        row_therm = Adw.ActionRow()
+        row_therm.set_child(box)
+        therm_group.add(row_therm)
+        page.add(therm_group)
+
+        bat_group = Adw.PreferencesGroup(
+            title="Perawatan Baterai",
+            description="Conservation Mode membatasi pengisian ~75-80% untuk memperpanjang umur baterai.",
+        )
+        self.combo_bat = Adw.ComboRow(
+            title="Mode Pengisian Daya",
+            model=Gtk.StringList.new(["Standard (100%)", "Conservation Mode (~80%)", "Rapid Charge (Cepat)"]),
+        )
+        self.combo_bat.connect("notify::selected", self.on_battery_mode_changed)
+        bat_group.add(self.combo_bat)
+        page.add(bat_group)
+
+        wmi_attrs_dirs = glob.glob("/sys/class/firmware-attributes/lenovo-wmi-other*/attributes")
+        if wmi_attrs_dirs:
+            wmi_dir = wmi_attrs_dirs[0]
+            wmi_group = Adw.PreferencesGroup(
+                title="Custom Mode Tuning (lenovo-wmi-other)",
+                description="Berlaku hanya saat Mode Termal disetel ke 'Custom'.",
+            )
+            important_attrs = [
+                ("ppt_pl1_spl", "CPU Sustained Power Limit (PL1 / W)"),
+                ("ppt_pl2_sppt", "CPU Slow Power Limit (PL2 / W)"),
+                ("ppt_pl3_fppt", "CPU Fast Power Limit (PL3 / W)"),
+                ("cpu_temp", "Batas Suhu CPU (°C)"),
+                ("gpu_nv_ctgp", "GPU Configurable TGP (W)"),
+                ("gpu_temp", "Batas Suhu GPU (°C)"),
+            ]
+            for attr_key, title in important_attrs:
+                p = os.path.join(wmi_dir, attr_key)
+                if not os.path.isdir(p):
+                    continue
+                cur = int(read_sys(os.path.join(p, "current_value")) or 0)
+                min_v = int(read_sys(os.path.join(p, "min_value")) or 0)
+                max_v = int(read_sys(os.path.join(p, "max_value")) or 150)
+                step = int(read_sys(os.path.join(p, "scalar_increment")) or 1)
+                if max_v <= min_v:
+                    continue
+
+                row = Adw.ActionRow(title=title, subtitle=f"Rentang: {min_v} – {max_v} (Saat ini: {cur})")
+                spin = Gtk.SpinButton.new_with_range(min_v, max_v, max(1, step))
+                spin.set_value(cur)
+                spin.set_valign(Gtk.Align.CENTER)
+                apply_btn = Gtk.Button(label="Terapkan")
+                apply_btn.set_valign(Gtk.Align.CENTER)
+                apply_btn.connect(
+                    "clicked",
+                    lambda _b, k=attr_key, s=spin: self.run_ctl(
+                        ["wmi-attr", k, str(int(s.get_value()))],
+                        lambda: self.show_toast(f"{k} diperbarui"),
+                    ),
+                )
+                row.add_suffix(spin)
+                row.add_suffix(apply_btn)
+                wmi_group.add(row)
+            page.add(wmi_group)
+
+        self.view_stack.add_titled_with_icon(page, "power", "Performa & Daya", "power-profile-performance-symbolic")
+
+    # ---------------- PAGE 3: KEYBOARD & RGB ----------------
+    def build_keyboard_page(self):
+        page = Adw.PreferencesPage()
+        self.rgb_candidates = find_rgb_candidates()
+
+        if self.rgb_candidates:
+            rgb_group = Adw.PreferencesGroup(
+                title="Keyboard 4-Zone RGB (ITE HID)",
+                description="Otomatis memprioritaskan interface dengan Report ID 0xCC dan mencoba fallback jika diperlukan.",
+            )
+
+            self.combo_rgb_dev = Adw.ComboRow(
+                title="Interface Perangkat (hidraw)",
+                model=Gtk.StringList.new([c[2] for c in self.rgb_candidates]),
+            )
+            self.combo_rgb_dev.set_selected(0)
+
+            self.combo_rgb_effect = Adw.ComboRow(
+                title="Efek Pencahayaan",
+                model=Gtk.StringList.new(["Static", "Breath", "Wave", "Hue Cycle", "Mati (Off)"]),
+            )
+            self.combo_rgb_effect.set_selected(0)
+
+            self.combo_rgb_wave_dir = Adw.ComboRow(
+                title="Arah Animasi Wave",
+                model=Gtk.StringList.new(["Kiri → Kanan", "Kanan → Kiri"]),
+            )
+            self.combo_rgb_wave_dir.set_selected(0)
+
+            self.combo_rgb_bright = Adw.ComboRow(
+                title="Kecerahan",
+                model=Gtk.StringList.new(["Mati (Off)", "Redup (Low)", "Terang (High)"]),
+            )
+            self.combo_rgb_bright.set_selected(2)
+
+            self.combo_rgb_speed = Adw.ComboRow(
+                title="Kecepatan Efek",
+                model=Gtk.StringList.new(["1 (Lambat)", "2", "3", "4 (Cepat)"]),
+            )
+            self.combo_rgb_speed.set_selected(1)
+
+            for r in (
+                self.combo_rgb_dev,
+                self.combo_rgb_effect,
+                self.combo_rgb_wave_dir,
+                self.combo_rgb_bright,
+                self.combo_rgb_speed,
+            ):
+                rgb_group.add(r)
+
+            self.zone_buttons = []
+            default_colors = ["#00B4FF", "#0066FF", "#7B2CBF", "#FF007F"]
+            zone_row = Adw.ActionRow(title="Warna 4 Zona", subtitle="Zona 1 (Kiri) hingga Zona 4 (Numpad)")
+            zbox = Gtk.Box(spacing=8)
+            zbox.set_valign(Gtk.Align.CENTER)
+            for idx in range(4):
+                dlg = Gtk.ColorDialog(with_alpha=False)
+                btn = Gtk.ColorDialogButton(dialog=dlg)
+                rgba = Gdk.RGBA()
+                rgba.parse(default_colors[idx])
+                btn.set_rgba(rgba)
+                self.zone_buttons.append(btn)
+                zbox.append(btn)
+            zone_row.add_suffix(zbox)
+            rgb_group.add(zone_row)
+
+            act_row = Adw.ActionRow()
+            hbox = Gtk.Box(spacing=10, margin_top=6, margin_bottom=6)
+            btn_apply = Gtk.Button(label="Terapkan RGB")
+            btn_apply.add_css_class("suggested-action")
+            btn_apply.connect("clicked", self.on_apply_rgb)
+
+            btn_sync = Gtk.Button(label="Samakan Semua Zona (Zona 1)")
+            btn_sync.connect("clicked", self.on_sync_zones)
+
+            hbox.append(btn_apply)
+            hbox.append(btn_sync)
+            act_row.set_child(hbox)
+            rgb_group.add(act_row)
+            page.add(rgb_group)
+        else:
+            leds = sorted(glob.glob("/sys/class/leds/*::kbd_backlight"))
+            kbd_group = Adw.PreferencesGroup(
+                title="Keyboard Backlight",
+                description="4-Zone RGB USB (048D) tidak terdeteksi. Menggunakan kontrol sysfs jika tersedia.",
+            )
+            if leds:
+                row = Adw.ComboRow(
+                    title="Kecerahan Backlight Putih",
+                    model=Gtk.StringList.new(["Mati (0)", "Redup (1)", "Terang (2)"]),
+                )
+                cur_b = int(read_sys(os.path.join(leds[0], "brightness")) or 0)
+                row.set_selected(min(2, cur_b))
+                row.connect(
+                    "notify::selected",
+                    lambda r, _p: self.run_ctl(["kbd-sysfs", str(r.get_selected())]),
+                )
+                kbd_group.add(row)
+            else:
+                kbd_group.add(
+                    Adw.ActionRow(
+                        title="Perangkat RGB/Backlight tidak terdeteksi",
+                        subtitle="Periksa lsusb untuk melihat ID keyboard ITE (048d:xxxx).",
+                    )
+                )
+            page.add(kbd_group)
+
+        self.view_stack.add_titled_with_icon(page, "keyboard", "Keyboard RGB", "input-keyboard-symbolic")
+
+    # ---------------- PAGE 4: PERANGKAT ----------------
+    def build_device_page(self):
+        page = Adw.PreferencesPage()
+        dev_group = Adw.PreferencesGroup(
+            title="Kontrol Perangkat Keras (ideapad_laptop)",
+            description="Mengatur fitur BIOS/EC Lenovo Vantage secara langsung.",
+        )
+
+        self.device_switches = {}
+        items = [
+            ("fn_lock", "Fn Lock", "Aktifkan tombol media F1–F12 tanpa menekan Fn."),
+            ("usb_charging", "Always-On USB Charging", "Izinkan pengisian daya lewat port USB saat laptop mati/sleep."),
+            ("touchpad", "Touchpad", "Aktifkan atau matikan touchpad internal."),
+            ("camera_power", "Daya Kamera (Software E-Shutter)", "Matikan daya modul kamera (saklar fisik samping tetap berlaku)."),
+        ]
+
+        for key, title, sub in items:
+            sw = Adw.SwitchRow(title=title, subtitle=sub)
+            exists = os.path.exists(os.path.join(VPC_DIR, key))
+            sw.set_sensitive(exists)
+            if not exists:
+                sw.set_subtitle("Tidak diekspos oleh firmware/kernel ini.")
+            sw.connect("notify::active", self.on_device_switch_toggled, key)
+            self.device_switches[key] = sw
+            dev_group.add(sw)
+
+        page.add(dev_group)
+
+        # Kernel Fan Sensor Helper
+        fan_group = Adw.PreferencesGroup(
+            title="Diagnostik Sensor Kipas (Kernel)",
+            description="Jika RPM kipas tidak terbaca, aktifkan parameter expose_all_fans untuk modul lenovo_wmi_other lalu reboot.",
+        )
+        row_exp = Adw.ActionRow(
+            title="Aktifkan lenovo_wmi_other.expose_all_fans=1",
+            subtitle="Menulis /etc/modprobe.d/loq-vantage-fans.conf (butuh reboot).",
+        )
+        btn_exp = Gtk.Button(label="Pasang Konfigurasi")
+        btn_exp.set_valign(Gtk.Align.CENTER)
+        btn_exp.connect(
+            "clicked",
+            lambda _b: self.run_ctl(
+                ["enable-fan-sensor"],
+                lambda: self.show_toast("Konfigurasi disimpan. Silakan reboot agar berlaku."),
+            ),
+        )
+        row_exp.add_suffix(btn_exp)
+        fan_group.add(row_exp)
+        page.add(fan_group)
+
+        self.view_stack.add_titled_with_icon(page, "devices", "Perangkat", "preferences-system-symbolic")
+
+    # ---------------- CALLBACKS & SYNC ----------------
+    def _on_timer(self):
+        self.refresh_state()
+        return True
+
+    def refresh_state(self):
+        self._updating_ui = True
+        try:
+            self.row_cpu.set_subtitle(get_cpu_telemetry())
+            self.row_gpu.set_subtitle(get_nvidia_status())
+            fan_text, fan_hint = get_fans_telemetry()
+            self.row_fan.set_subtitle(f"{fan_text} — {fan_hint}" if fan_hint else fan_text)
+
+            bat_l1, bat_l2, bat_mode = get_battery_telemetry()
+            self.row_bat.set_subtitle(bat_l1)
+            self.lbl_bat_health.set_text(bat_l2)
+
+            bat_idx = {"standard": 0, "conservation": 1, "rapid": 2}.get(bat_mode, 0)
+            if self.combo_bat.get_selected() != bat_idx:
+                self.combo_bat.set_selected(bat_idx)
+
+            prof_path, _ = find_platform_profile_paths()
+            cur_prof = read_sys(prof_path) if prof_path else "unknown"
+            self.lbl_profile_badge.set_text((cur_prof or "unknown").upper())
+            for k, btn in self.profile_buttons.items():
+                if btn.get_active() != (k == cur_prof):
+                    btn.set_active(k == cur_prof)
+
+            for key, sw in self.device_switches.items():
+                val = read_sys(os.path.join(VPC_DIR, key))
+                if val in ("0", "1"):
+                    active = val == "1"
+                    if sw.get_active() != active:
+                        sw.set_active(active)
+        finally:
+            self._updating_ui = False
+
+    def on_profile_toggled(self, btn, key):
+        if self._updating_ui or not btn.get_active():
+            return
+        self.run_ctl(["profile", key], lambda: self.show_toast(f"Mode diubah ke {key}"))
+
+    def on_battery_mode_changed(self, row, _param):
+        if self._updating_ui:
+            return
+        idx = row.get_selected()
+        mode = {0: "standard", 1: "conservation", 2: "rapid"}.get(idx, "standard")
+        self.run_ctl(["battery", mode], lambda: self.show_toast(f"Mode baterai: {mode}"))
+
+    def on_device_switch_toggled(self, row, _param, key):
+        if self._updating_ui:
+            return
+        val = "1" if row.get_active() else "0"
+        self.run_ctl(["ideapad", key, val])
+
+    def on_sync_zones(self, _btn):
+        c0 = self.zone_buttons[0].get_rgba()
+        for b in self.zone_buttons[1:]:
+            b.set_rgba(c0)
+
+    def on_apply_rgb(self, _btn):
+        if not self.rgb_candidates:
+            return
+        effect_map = {0: 0x01, 1: 0x03, 2: 0x04, 3: 0x06, 4: 0x00}
+        effect = effect_map.get(self.combo_rgb_effect.get_selected(), 0x01)
+        speed = self.combo_rgb_speed.get_selected() + 1
+        bright_sel = self.combo_rgb_bright.get_selected()
+        wave_dir = self.combo_rgb_wave_dir.get_selected()
+
+        if bright_sel == 0 or effect == 0x00:
+            effect = 0x00
+            brightness = 1
+            zones = [(0, 0, 0)] * 4
+        else:
+            brightness = bright_sel  # 1=low, 2=high
+            zones = []
+            for b in self.zone_buttons:
+                rgba = b.get_rgba()
+                zones.append((
+                    int(round(rgba.red * 255)),
+                    int(round(rgba.green * 255)),
+                    int(round(rgba.blue * 255)),
+                ))
+
+        buf = build_rgb_packet(effect, speed, brightness, zones, wave_dir=wave_dir)
+        sel_idx = self.combo_rgb_dev.get_selected()
+
+        # Susun urutan percobaan: node terpilih dulu, lalu kandidat 048D lainnya
+        ordered = [(sel_idx, self.rgb_candidates[sel_idx][1])]
+        for i, cand in enumerate(self.rgb_candidates):
+            if i != sel_idx:
+                ordered.append((i, cand[1]))
+
+        last_err = None
+        for idx, dev_path in ordered:
+            try:
+                send_rgb_packet_direct(dev_path, buf)
+                if idx != sel_idx:
+                    self.combo_rgb_dev.set_selected(idx)
+                self.show_toast(f"RGB diterapkan via {dev_path}")
+                return
+            except PermissionError:
+                # Fallback via helper root jika izin udev hidraw belum aktif
+                self.run_ctl(
+                    ["rgb", os.path.basename(dev_path), buf.hex()],
+                    lambda p=dev_path: self.show_toast(f"RGB diterapkan via {p} (root)"),
+                )
+                return
+            except OSError as e:
+                last_err = f"{dev_path}: {e}"
+                continue
+
+        self.show_toast(f"Gagal mengirim RGB ({last_err})")
+
+
+class LOQVantageApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="com.lenovo.loqvantage")
+
+    def do_activate(self):
+        win = self.props.active_window
+        if not win:
+            win = LOQVantageWindow(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    app = LOQVantageApp()
+    app.run(None)

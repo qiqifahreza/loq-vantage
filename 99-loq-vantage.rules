@@ -1,0 +1,2 @@
+# ITE 4-Zone RGB Keyboard Controllers (Lenovo LOQ & Legion)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c9*", TAG+="uaccess", GROUP="wheel", MODE="0660"
