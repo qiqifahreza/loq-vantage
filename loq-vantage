@@ -19,6 +19,112 @@ VPC_DIR = "/sys/bus/platform/devices/VPC2004:00"
 HIDIOCSFEATURE_33 = 0xC0214806  # _IOWR('H', 0x06, 33)
 ITE_VENDOR_ID = "0000048D"
 
+APP_CSS = b"""
+window.loq-window {
+  background: #10131d;
+  color: #f4f6ff;
+}
+
+.app-shell {
+  background: linear-gradient(135deg, #10131d, #171d2d);
+}
+
+.glass-sidebar {
+  background: linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0.035));
+  border-right: 1px solid rgba(255,255,255,0.12);
+  padding: 20px 14px;
+}
+
+.brand-mark {
+  background: linear-gradient(145deg, #76d6ff, #6678ff 55%, #c66cff);
+  color: #10131d;
+  border-radius: 14px;
+  font-weight: 900;
+  min-width: 42px;
+  min-height: 42px;
+}
+
+.brand-title {
+  font-size: 17px;
+  font-weight: 800;
+}
+
+.brand-subtitle, .sidebar-caption, .eyebrow {
+  color: #aeb8d3;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.sidebar-caption {
+  margin: 24px 8px 8px;
+}
+
+button.nav-button {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  color: #cbd2e5;
+  margin: 2px 0;
+  padding: 9px 10px;
+  transition: background 180ms ease, border-color 180ms ease;
+}
+
+button.nav-button:hover {
+  background: rgba(255,255,255,0.07);
+}
+
+button.nav-button:checked {
+  background: linear-gradient(110deg, rgba(92,151,255,0.28), rgba(155,113,255,0.16));
+  border-color: rgba(154,190,255,0.28);
+  color: #ffffff;
+}
+
+.glass-content {
+  background: transparent;
+}
+
+.content-page {
+  padding: 24px;
+}
+
+.hero-card {
+  background: linear-gradient(120deg, rgba(84,150,255,0.24), rgba(169,110,255,0.17) 58%, rgba(255,255,255,0.08));
+  border: 1px solid rgba(255,255,255,0.20);
+  border-radius: 22px;
+  box-shadow: 0 16px 38px rgba(0,0,0,0.24), inset 0 1px rgba(255,255,255,0.16);
+  margin-bottom: 4px;
+  padding: 22px 24px;
+}
+
+.hero-title {
+  color: #ffffff;
+  font-size: 27px;
+  font-weight: 800;
+}
+
+.hero-subtitle {
+  color: #c6cee2;
+  font-size: 13px;
+}
+
+.glass-group .boxed-list {
+  background: linear-gradient(145deg, rgba(255,255,255,0.085), rgba(255,255,255,0.035));
+  border: 1px solid rgba(255,255,255,0.13);
+  border-radius: 16px;
+  box-shadow: 0 10px 24px rgba(0,0,0,0.16), inset 0 1px rgba(255,255,255,0.08);
+}
+
+.glass-group > label {
+  color: #edf1ff;
+  font-weight: 750;
+}
+
+.glass-group > label + label {
+  color: #aeb8d3;
+  font-size: 12px;
+}
+"""
+
 
 def read_sys(path):
     try:
@@ -250,24 +356,40 @@ def get_battery_telemetry():
 class LOQVantageWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="LOQ Vantage")
-        self.set_default_size(800, 700)
+        self.set_default_size(1120, 760)
+        self.add_css_class("loq-window")
         self._updating_ui = False
 
         self.toast_overlay = Adw.ToastOverlay()
         toolbar_view = Adw.ToolbarView()
 
         header = Adw.HeaderBar()
-        self.view_stack = Adw.ViewStack()
-        switcher = Adw.ViewSwitcher(stack=self.view_stack, policy=Adw.ViewSwitcherPolicy.WIDE)
-        header.set_title_widget(switcher)
+        brand = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        brand_mark = Gtk.Label(label="L")
+        brand_mark.add_css_class("brand-mark")
+        brand_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        brand_title = Gtk.Label(label="LOQ Vantage", xalign=0)
+        brand_title.add_css_class("brand-title")
+        brand_subtitle = Gtk.Label(label="CONTROL CENTER", xalign=0)
+        brand_subtitle.add_css_class("brand-subtitle")
+        brand_text.append(brand_title)
+        brand_text.append(brand_subtitle)
+        brand.append(brand_mark)
+        brand.append(brand_text)
+        header.set_title_widget(brand)
         toolbar_view.add_top_bar(header)
+
+        self.view_stack = Gtk.Stack()
+        self.view_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.view_stack.set_transition_duration(180)
+        self.view_stack.add_css_class("glass-content")
 
         self.build_dashboard_page()
         self.build_power_page()
         self.build_keyboard_page()
         self.build_device_page()
 
-        toolbar_view.set_content(self.view_stack)
+        toolbar_view.set_content(self.build_app_shell())
         self.toast_overlay.set_child(toolbar_view)
         self.set_content(self.toast_overlay)
 
@@ -276,6 +398,74 @@ class LOQVantageWindow(Adw.ApplicationWindow):
 
     def show_toast(self, msg):
         self.toast_overlay.add_toast(Adw.Toast.new(msg))
+
+    def create_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        page.add_css_class("content-page")
+        page.set_margin_start(10)
+        page.set_margin_end(10)
+        page.set_margin_top(8)
+        page.set_margin_bottom(20)
+        return page
+
+    def add_group(self, page, group):
+        group.add_css_class("glass-group")
+        page.append(group)
+
+    def add_page(self, page, name, title):
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_child(page)
+        self.view_stack.add_titled(scroller, name, title)
+
+    def build_app_shell(self):
+        shell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        shell.add_css_class("app-shell")
+
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        sidebar.add_css_class("glass-sidebar")
+        sidebar.set_size_request(218, -1)
+
+        caption = Gtk.Label(label="WORKSPACE", xalign=0)
+        caption.add_css_class("sidebar-caption")
+        sidebar.append(caption)
+
+        navigation = (
+            ("dashboard", "Dashboard", "computer-symbolic"),
+            ("power", "Performa & Daya", "power-profile-performance-symbolic"),
+            ("keyboard", "Keyboard RGB", "input-keyboard-symbolic"),
+            ("devices", "Perangkat", "preferences-system-symbolic"),
+        )
+        first_button = None
+        for name, title, icon in navigation:
+            button = Gtk.ToggleButton()
+            button.add_css_class("nav-button")
+            if first_button is None:
+                first_button = button
+            else:
+                button.set_group(first_button)
+
+            contents = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            image = Gtk.Image.new_from_icon_name(icon)
+            label = Gtk.Label(label=title, xalign=0)
+            label.set_hexpand(True)
+            contents.append(image)
+            contents.append(label)
+            button.set_child(contents)
+            button.connect("toggled", self.on_navigation_toggled, name)
+            sidebar.append(button)
+            if name == "dashboard":
+                button.set_active(True)
+
+        self.view_stack.set_hexpand(True)
+        self.view_stack.set_vexpand(True)
+        shell.append(sidebar)
+        shell.append(self.view_stack)
+        return shell
+
+    def on_navigation_toggled(self, button, page_name):
+        if button.get_active():
+            self.view_stack.set_visible_child_name(page_name)
 
     def run_ctl(self, args, on_done=None):
         def worker():
@@ -297,19 +487,32 @@ class LOQVantageWindow(Adw.ApplicationWindow):
 
     # ---------------- PAGE 1: DASHBOARD ----------------
     def build_dashboard_page(self):
-        page = Adw.PreferencesPage()
+        page = self.create_page()
 
-        sys_group = Adw.PreferencesGroup(title="Informasi Sistem")
         model = read_sys("/sys/class/dmi/id/product_version") or "Lenovo LOQ"
         sku = read_sys("/sys/class/dmi/id/product_name") or "83DV"
         bios = read_sys("/sys/class/dmi/id/bios_version") or "Unknown"
+        hero = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        hero.add_css_class("hero-card")
+        eyebrow = Gtk.Label(label="LENOVO LOQ  /  DEVICE OVERVIEW", xalign=0)
+        eyebrow.add_css_class("eyebrow")
+        hero_title = Gtk.Label(label="Performa maksimal, kendali penuh.", xalign=0)
+        hero_title.add_css_class("hero-title")
+        hero_subtitle = Gtk.Label(label=f"{model} · Type {sku} · BIOS {bios}", xalign=0)
+        hero_subtitle.add_css_class("hero-subtitle")
+        hero.append(eyebrow)
+        hero.append(hero_title)
+        hero.append(hero_subtitle)
+        page.append(hero)
+
+        sys_group = Adw.PreferencesGroup(title="Informasi Sistem")
 
         self.row_model = Adw.ActionRow(title=f"{model} (Type {sku})", subtitle=f"BIOS: {bios}")
         self.lbl_profile_badge = Gtk.Label(label="-")
         self.lbl_profile_badge.add_css_class("pill")
         self.row_model.add_suffix(self.lbl_profile_badge)
         sys_group.add(self.row_model)
-        page.add(sys_group)
+        self.add_group(page, sys_group)
 
         tel_group = Adw.PreferencesGroup(title="Telemetri Real-Time")
         self.row_cpu = Adw.ActionRow(title="Prosesor (CPU)", subtitle="Memuat...")
@@ -322,13 +525,13 @@ class LOQVantageWindow(Adw.ApplicationWindow):
 
         for r in (self.row_cpu, self.row_gpu, self.row_fan, self.row_bat):
             tel_group.add(r)
-        page.add(tel_group)
+        self.add_group(page, tel_group)
 
-        self.view_stack.add_titled_with_icon(page, "dashboard", "Dashboard", "computer-symbolic")
+        self.add_page(page, "dashboard", "Dashboard")
 
     # ---------------- PAGE 2: PERFORMA & DAYA ----------------
     def build_power_page(self):
-        page = Adw.PreferencesPage()
+        page = self.create_page()
 
         therm_group = Adw.PreferencesGroup(
             title="Mode Termal (Fn + Q)",
@@ -365,7 +568,7 @@ class LOQVantageWindow(Adw.ApplicationWindow):
         row_therm = Adw.ActionRow()
         row_therm.set_child(box)
         therm_group.add(row_therm)
-        page.add(therm_group)
+        self.add_group(page, therm_group)
 
         bat_group = Adw.PreferencesGroup(
             title="Perawatan Baterai",
@@ -377,7 +580,7 @@ class LOQVantageWindow(Adw.ApplicationWindow):
         )
         self.combo_bat.connect("notify::selected", self.on_battery_mode_changed)
         bat_group.add(self.combo_bat)
-        page.add(bat_group)
+        self.add_group(page, bat_group)
 
         wmi_attrs_dirs = glob.glob("/sys/class/firmware-attributes/lenovo-wmi-other*/attributes")
         if wmi_attrs_dirs:
@@ -421,13 +624,13 @@ class LOQVantageWindow(Adw.ApplicationWindow):
                 row.add_suffix(spin)
                 row.add_suffix(apply_btn)
                 wmi_group.add(row)
-            page.add(wmi_group)
+            self.add_group(page, wmi_group)
 
-        self.view_stack.add_titled_with_icon(page, "power", "Performa & Daya", "power-profile-performance-symbolic")
+        self.add_page(page, "power", "Performa & Daya")
 
     # ---------------- PAGE 3: KEYBOARD & RGB ----------------
     def build_keyboard_page(self):
-        page = Adw.PreferencesPage()
+        page = self.create_page()
         self.rgb_candidates = find_rgb_candidates()
 
         if self.rgb_candidates:
@@ -504,7 +707,7 @@ class LOQVantageWindow(Adw.ApplicationWindow):
             hbox.append(btn_sync)
             act_row.set_child(hbox)
             rgb_group.add(act_row)
-            page.add(rgb_group)
+            self.add_group(page, rgb_group)
         else:
             leds = sorted(glob.glob("/sys/class/leds/*::kbd_backlight"))
             kbd_group = Adw.PreferencesGroup(
@@ -530,13 +733,13 @@ class LOQVantageWindow(Adw.ApplicationWindow):
                         subtitle="Periksa lsusb untuk melihat ID keyboard ITE (048d:xxxx).",
                     )
                 )
-            page.add(kbd_group)
+            self.add_group(page, kbd_group)
 
-        self.view_stack.add_titled_with_icon(page, "keyboard", "Keyboard RGB", "input-keyboard-symbolic")
+        self.add_page(page, "keyboard", "Keyboard RGB")
 
     # ---------------- PAGE 4: PERANGKAT ----------------
     def build_device_page(self):
-        page = Adw.PreferencesPage()
+        page = self.create_page()
         dev_group = Adw.PreferencesGroup(
             title="Kontrol Perangkat Keras (ideapad_laptop)",
             description="Mengatur fitur BIOS/EC Lenovo Vantage secara langsung.",
@@ -560,7 +763,7 @@ class LOQVantageWindow(Adw.ApplicationWindow):
             self.device_switches[key] = sw
             dev_group.add(sw)
 
-        page.add(dev_group)
+        self.add_group(page, dev_group)
 
         # Kernel Fan Sensor Helper
         fan_group = Adw.PreferencesGroup(
@@ -582,9 +785,9 @@ class LOQVantageWindow(Adw.ApplicationWindow):
         )
         row_exp.add_suffix(btn_exp)
         fan_group.add(row_exp)
-        page.add(fan_group)
+        self.add_group(page, fan_group)
 
-        self.view_stack.add_titled_with_icon(page, "devices", "Perangkat", "preferences-system-symbolic")
+        self.add_page(page, "devices", "Perangkat")
 
     # ---------------- CALLBACKS & SYNC ----------------
     def _on_timer(self):
@@ -704,10 +907,18 @@ class LOQVantageWindow(Adw.ApplicationWindow):
 class LOQVantageApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id="com.lenovo.loqvantage")
+        self.css_provider = None
 
     def do_activate(self):
         win = self.props.active_window
         if not win:
+            self.css_provider = Gtk.CssProvider()
+            self.css_provider.load_from_data(APP_CSS)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(),
+                self.css_provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
             win = LOQVantageWindow(self)
         win.present()
 

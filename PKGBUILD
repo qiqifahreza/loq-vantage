@@ -1,7 +1,7 @@
 # Maintainer: LOQ Vantage contributors
 pkgname=loq-vantage
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="GTK4 control panel for Lenovo LOQ laptop hardware"
 arch=('any')
 license=('unknown')
