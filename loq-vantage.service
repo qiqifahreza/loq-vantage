@@ -1,0 +1,13 @@
+[Unit]
+Description=LOQ Vantage tray application
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/loq-vantage --background
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

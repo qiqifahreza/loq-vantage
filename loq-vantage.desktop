@@ -2,7 +2,7 @@
 Name=LOQ Vantage
 Comment=Pengaturan Performa, Baterai, RGB & Perangkat Lenovo LOQ 15IRX9
 Exec=/usr/bin/loq-vantage
-Icon=preferences-system
+Icon=loq-vantage
 Terminal=false
 Type=Application
 Categories=System;Settings;Utility;

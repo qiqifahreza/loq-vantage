@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3, Gtk
+
+APP_ID = "com.lenovo.loqvantage"
+ICON_NAME = "loq-vantage"
+ICON_PATH = "/usr/share/icons/hicolor/scalable/apps"
+
+
+def invoke_action(action_name):
+    try:
+        subprocess.run(
+            ["gapplication", "action", APP_ID, action_name],
+            check=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"Gagal menjalankan aksi LOQ Vantage '{action_name}': {exc}", file=sys.stderr)
+
+
+def main():
+    indicator = AyatanaAppIndicator3.Indicator.new(
+        "loq-vantage",
+        ICON_NAME,
+        AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+    )
+    indicator.set_icon_theme_path(ICON_PATH)
+    indicator.set_title("LOQ Vantage")
+    indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+
+    menu = Gtk.Menu()
+    toggle_item = Gtk.MenuItem.new_with_label("Tampilkan / Sembunyikan LOQ Vantage")
+    toggle_item.connect("activate", lambda _item: invoke_action("toggle-window"))
+    menu.append(toggle_item)
+
+    quit_item = Gtk.MenuItem.new_with_label("Keluar")
+    quit_item.connect("activate", lambda _item: invoke_action("quit"))
+    menu.append(quit_item)
+
+    menu.show_all()
+    indicator.set_menu(menu)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

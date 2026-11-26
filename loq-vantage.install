@@ -1,6 +1,10 @@
 post_install() {
   udevadm control --reload-rules
   udevadm trigger --subsystem-match=hidraw
+  echo "Muat ulang unit user: systemctl --user daemon-reload"
+  echo "Autostart tray: systemctl --user enable --now loq-vantage.service"
+  echo "Disable autostart: systemctl --user disable --now loq-vantage.service"
+  echo "GNOME mungkin memerlukan gnome-shell-extension-appindicator agar ikon tray terlihat."
 }
 
 post_upgrade() {
